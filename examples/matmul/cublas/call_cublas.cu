@@ -8,6 +8,11 @@
 // Running cost of CuBLAS is 1.80772ms
 // TFLOPS: 65.4859
 
+// NVIDIA PG506-230
+// Test performance using shape M=5376, N=5376, K=2048
+// Running cost (ms) of CuBLAS is 0.557507
+// TFLOPS: 212.338
+
 #include <cuda_fp16.h>
 #include <iostream>
 #include <cuda_runtime.h>
@@ -65,14 +70,31 @@ gemm(cublasHandle_t handle,
      const float* beta,
      half* C, int ldC)
 {
-  return cublasGemmEx(handle, transA, transB,
-                      m, n, k,
-                      reinterpret_cast<const float*>(alpha),
-                      reinterpret_cast<const __half*>(A), CUDA_R_16F, ldA,
-                      reinterpret_cast<const __half*>(B), CUDA_R_16F, ldB,
-                      reinterpret_cast<const float*>(beta),
-                      reinterpret_cast<      __half*>(C), CUDA_R_16F, ldC,
-                      CUDA_R_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+  // cublasSgemm函数的数学公式为：
+  // C = alpha * op(A) * op(B) + beta * C
+  // 这里的运算符op决定是否转置
+  // cublas默认是列优先存储
+  return cublasGemmEx(handle,   // cuBLAS 上下文句柄，初始化后传入
+    transA,                     // 矩阵 A 的操作：CUBLAS_OP_N（不转置）、CUBLAS_OP_T（转置）、CUBLAS_OP_C（共轭转置）
+    transB,                     // 矩阵 B 的操作：CUBLAS_OP_N（不转置）、CUBLAS_OP_T（转置）、CUBLAS_OP_C（共轭转置）
+    m,                          // 矩阵 C 的行数, 也是 A（或转置后 A）的行数
+    n,                          // 矩阵 C 的列数, 也是 B（或转置后 B）的列数
+    k,                          // A（或转置后 A）的列数，也是 B（或转置后 B）的行数
+    reinterpret_cast<const float*>(alpha),  // 标量乘数，类型与计算类型一致
+    reinterpret_cast<const __half*>(A),     // 输入矩阵 A 的指针（设备内存）
+    CUDA_R_16F,                             // 输入矩阵 A 的类型
+    ldA,                                    // 矩阵 A（或转置后 A）的领先维度
+                                            // Leading Dimension = 从一行/列的第一个元素到下一行/列第一个元素的步长
+    reinterpret_cast<const __half*>(B),      // 输入矩阵 B 的指针（设备内存）
+    CUDA_R_16F,                             // 输入矩阵 B 的类型
+    ldB,                                    // 矩阵 B（或转置后 B）的领先维度（列优先存储时为实际列数）
+    reinterpret_cast<const float*>(beta),    // 加法系数
+    reinterpret_cast<      __half*>(C),      // 输出矩阵 C 的指针（设备内存）
+    CUDA_R_16F,                             // 输出矩阵 C 的类型
+    ldC,                                    // 矩阵 C 的领先维度（行优先存储时为实际行数）
+    CUDA_R_32F,                             // 输出类型
+    CUBLAS_GEMM_DEFAULT_TENSOR_OP           // 计算类型, 这是使用Tensor Core的计算类型, CUBLAS_GEMM_DEFAULT自动选择最优算法
+  );
 }
 #else
 inline cublasStatus_t
@@ -195,6 +217,18 @@ int main(int argc, char *argv[])
     cudaEventRecord(start);
     for (int i = 0; i < 200; ++i)
     {
+        // 思考关键点：不管A和B的存储方式，leading dimension设置为K都是不变的, 表示的意思是多少个元素到下一行/列
+        // 假设矩阵大小是
+        // A: M * K
+        // B: N * K
+        // C: M * N
+        // 我想计算C = A * B^T
+        // dA: 行优先存储，leading dimension设置为K, 说明每一行元素个数是K，读取是A
+        // dB: 列优先存储，leading dimension设置为K，说明每一列元素个数是K，读取是B^T
+        // dC: 列优先存储，leading dimension设置为M，说明每一行元素个数是M，读取是C
+        // cuBLAS默认是列优先存储
+        // 如果不对A进行转置，leading dimension仍然是K，从cublas角度来看，说明每一列个数是K，读取出来就是A^T
+        // 因此要对A进行转置
         gemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, M, N, K, &alpha, dA, K, dB, K, &beta, dC, M);
     }
     cudaEventRecord(stop);
